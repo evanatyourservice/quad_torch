@@ -18,8 +18,9 @@ class QUAD(torch.optim.Optimizer):
             dense.
         max_skew_dense: dimensions with skew larger than this compared to the other dimension will
             have diagonal preconditioners, otherwise dense.
+        noise_scale: scale of noise added to gradients.
         normalize_grads: normalize incoming gradients to unit norm.
-        dtype: dtype for all computations and states in QUAD.
+        dtype: dtype for all computations and states in QUAD. None defaults to dtype of gradients.
     """
     def __init__(
         self,
@@ -28,9 +29,10 @@ class QUAD(torch.optim.Optimizer):
         lr_style: str | None = "adam",
         momentum: float = 0.95,
         weight_decay: float = 0.1,
-        preconditioner_lr: float = 0.7,
+        preconditioner_lr: float = 0.6,
         max_size_dense: int = 8192,
         max_skew_dense: float = 1.0,
+        noise_scale: float = 1e-8,
         normalize_grads: bool = False,
         dtype: torch.dtype | None = None,
     ):
@@ -42,6 +44,7 @@ class QUAD(torch.optim.Optimizer):
             preconditioner_lr=preconditioner_lr,
             max_size_dense=max_size_dense,
             max_skew_dense=max_skew_dense,
+            noise_scale=noise_scale,
             normalize_grads=normalize_grads,
             dtype=dtype,
         )
@@ -82,7 +85,7 @@ class QUAD(torch.optim.Optimizer):
                 state["momentum_buffer"] = g.clone()
                 state["merged_shape"] = merge_dims(state["momentum_buffer"])
                 g_reshaped = state["momentum_buffer"].view(state["merged_shape"])
-                scale = (((torch.mean(torch.abs(g_reshaped)) + 0.00035)**2)**(-1/4))**(1/2 if len(g_reshaped.shape) > 1 else 1.0)
+                scale = (torch.mean(torch.abs(g_reshaped)) + group["noise_scale"])**(-1/(4 if len(g_reshaped.shape) > 1 else 2))
                 if g_reshaped.ndim <= 1:
                     state["Q"] = [scale * torch.ones_like(g_reshaped, dtype=dtype)]
                     state["L"] = [torch.zeros([], dtype=torch.float32, device=g_reshaped.device)]
@@ -160,12 +163,9 @@ class QUAD(torch.optim.Optimizer):
                 original_shape = g.shape
                 g_reshaped = g.view(merged_shape)
 
-                if state["step"] == 1:
-                    g_reshaped = g_reshaped + torch.randn_like(g_reshaped) * 0.00035
-
                 if g_reshaped.ndim <= 1:
                     g_preconditioned = update_diag_solo(
-                        Q[0], L[0], g_reshaped, group["preconditioner_lr"], state["step"]
+                        Q[0], L[0], g_reshaped, group["preconditioner_lr"], state["step"], group["noise_scale"]
                     )
                 else:
                     if state["step"] % 50 == 0:
@@ -186,7 +186,8 @@ class QUAD(torch.optim.Optimizer):
                             G=g_reshaped,
                             precond_lr=group["preconditioner_lr"],
                             step=state["step"],
-                            term2_target=term2_target
+                            term2_target=term2_target,
+                            noise_scale=group["noise_scale"]
                         )
                     elif diag[0] and not diag[1]:
                         g_preconditioned = precondition_dD(
@@ -194,7 +195,8 @@ class QUAD(torch.optim.Optimizer):
                             G=g_reshaped,
                             precond_lr=group["preconditioner_lr"],
                             step=state["step"],
-                            term2_target=term2_target
+                            term2_target=term2_target,
+                            noise_scale=group["noise_scale"]
                         )
                     elif not diag[0] and diag[1]:
                         g_preconditioned = precondition_Dd(
@@ -202,7 +204,8 @@ class QUAD(torch.optim.Optimizer):
                             G=g_reshaped,
                             precond_lr=group["preconditioner_lr"],
                             step=state["step"],
-                            term2_target=term2_target
+                            term2_target=term2_target,
+                            noise_scale=group["noise_scale"]
                         )
                     else:
                         g_preconditioned = precondition_dd(
@@ -210,7 +213,8 @@ class QUAD(torch.optim.Optimizer):
                             G=g_reshaped,
                             precond_lr=group["preconditioner_lr"],
                             step=state["step"],
-                            term2_target=term2_target
+                            term2_target=term2_target,
+                            noise_scale=group["noise_scale"]
                         )
 
                 original_shape = p.grad.shape
@@ -228,7 +232,7 @@ class QUAD(torch.optim.Optimizer):
                 params_with_grad,
                 preconditioned_grads,
                 # adam lr can be simulated by scaling down psgd update
-                alpha=-group["lr"] / 3.0 if group["lr_style"] == "adam" else -group["lr"]
+                alpha=-group["lr"] / 5.0 if group["lr_style"] == "adam" else -group["lr"]
             )
         return loss
 
@@ -237,13 +241,13 @@ def get_precond_lr(lr, step):
     return torch.clamp(lr * torch.rsqrt(1.0 + step / 10000.0), min=0.1)
 
 
-def add_noise(x, scale=1e-9):
+def add_noise(x, scale=1e-8):
     return x + torch.randn_like(x) * scale
 
 
 @torch.compile(fullgraph=True)
-def update_diag_solo(Q, L, G, precond_lr, step):
-    Pg = Q * Q * add_noise(G)
+def update_diag_solo(Q, L, G, precond_lr, step, noise_scale: float = 1e-8):
+    Pg = Q * Q * add_noise(G, scale=noise_scale)
     term1 = Pg * Pg
     term2 = 1.0
     ell = (torch.amax(term1) + term2).to(torch.float32)
@@ -264,40 +268,27 @@ def _diag_update(term1, term2, L, Q, precond_lr, step):
 
 def lb(A_outer: torch.Tensor):
     max_abs = A_outer.diagonal().max()
-
-    def _inner():
-        A = A_outer / max_abs
-        j = torch.argmax(torch.sum(A * A, dim=1))
-        x = A.index_select(0, j).view(-1)
-        x = A.mv(x)
-        x = x / x.norm()
-        return (A.mv(x)).norm() * max_abs.squeeze().clone()
-
-    return torch.cond(max_abs > 0, _inner, lambda: max_abs.squeeze().clone())
+    A = A_outer / max_abs
+    j = torch.argmax(torch.sum(A * A, dim=1))
+    x = A.index_select(0, j).view(-1)
+    x = A.mv(x)
+    x = x / x.norm()
+    return A.mv(x).norm() * max_abs
 
 
 def _dense_update(term1, term2, L, Q, precond_lr, step):
     ell = (lb(term1) + term2).to(torch.float32)
     L.copy_(torch.maximum(0.95 * L + 0.05 * ell, ell))
     lr_over_2L = (get_precond_lr(precond_lr, step) / (2 * L)).to(Q.dtype)
-    # original
-    # p = Q - lr_over_2L * (term1 @ Q - term2 * Q)
-    # p = p - lr_over_2L * (p @ term1 - p * term2)
-    # multiplicative
-    scale1 = 1 + lr_over_2L * term2
-    p = scale1 * Q - lr_over_2L * (term1 @ Q)
-    p = scale1 * p - lr_over_2L * (p @ term1)
-    # matmul
-    # M = -lr_over_2L * term1
-    # M.diagonal().add_(1 + lr_over_2L * term2)
-    # p = M @ Q @ M
+    p = Q - lr_over_2L * (term1 @ Q - term2 * Q)
+    p = p - lr_over_2L * (p @ term1 - p * term2)
     Q.copy_((p + p.T) / 2)
 
 
 @torch.compile(fullgraph=True)
-def precondition_dd(Ql, Qr, Ll, Lr, G, precond_lr, step, term2_target):
+def precondition_dd(Ql, Qr, Ll, Lr, G, precond_lr, step, term2_target, noise_scale: float = 1e-8):
     """Diagonal-diagonal preconditioning."""
-    Pg = (Ql * Ql).unsqueeze(1) * add_noise(G) * (Qr * Qr).unsqueeze(0)
+    Pg = (Ql * Ql).unsqueeze(1) * add_noise(G, scale=noise_scale) * (Qr * Qr).unsqueeze(0)
     
     # left diagonal update
     term1_l = (Pg * Pg).sum(1)
@@ -313,9 +304,9 @@ def precondition_dd(Ql, Qr, Ll, Lr, G, precond_lr, step, term2_target):
 
 
 @torch.compile(fullgraph=True)
-def precondition_dD(Ql, Qr, Ll, Lr, G, precond_lr, step, term2_target):
+def precondition_dD(Ql, Qr, Ll, Lr, G, precond_lr, step, term2_target, noise_scale: float = 1e-8):
     """Diagonal-dense preconditioning."""
-    Pg = (Ql * Ql).unsqueeze(1) * add_noise(G) @ (Qr.T @ Qr)
+    Pg = (Ql * Ql).unsqueeze(1) * add_noise(G, scale=noise_scale) @ (Qr.T @ Qr)
     
     # left diagonal update
     term1_l = (Pg * Pg).sum(1)
@@ -331,9 +322,9 @@ def precondition_dD(Ql, Qr, Ll, Lr, G, precond_lr, step, term2_target):
 
 
 @torch.compile(fullgraph=True)
-def precondition_Dd(Ql, Qr, Ll, Lr, G, precond_lr, step, term2_target):
+def precondition_Dd(Ql, Qr, Ll, Lr, G, precond_lr, step, term2_target, noise_scale: float = 1e-8):
     """Dense-diagonal preconditioning."""
-    Pg = (Ql.T @ Ql) @ G * (Qr * Qr).unsqueeze(0)
+    Pg = (Ql.T @ Ql) @ add_noise(G, scale=noise_scale) * (Qr * Qr).unsqueeze(0)
     
     # left dense update
     term1_l = Pg @ Pg.T
@@ -349,9 +340,9 @@ def precondition_Dd(Ql, Qr, Ll, Lr, G, precond_lr, step, term2_target):
 
 
 @torch.compile(fullgraph=True)
-def precondition_DD(Ql, Qr, Ll, Lr, G, precond_lr, step, term2_target):
+def precondition_DD(Ql, Qr, Ll, Lr, G, precond_lr, step, term2_target, noise_scale: float = 1e-8):
     """Dense-dense preconditioning."""
-    Pg = (Ql.T @ Ql) @ add_noise(G) @ (Qr.T @ Qr)
+    Pg = (Ql.T @ Ql) @ add_noise(G, scale=noise_scale) @ (Qr.T @ Qr)
     
     # left dense update
     term1_l = Pg @ Pg.T

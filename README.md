@@ -1,6 +1,8 @@
 # PSGD-QUAD
-An implementation of PSGD-QUAD for PyTorch.
 
+`pip install quad-torch`
+
+An implementation of PSGD-QUAD for PyTorch.
 
 ```python
 import torch
@@ -13,9 +15,10 @@ optimizer = QUAD(
     lr_style="adam",  # "adam", "mu-p", or None
     momentum=0.95,
     weight_decay=0.1,
-    preconditioner_lr=0.7,
+    preconditioner_lr=0.6,
     max_size_dense=8192,
     max_skew_dense=1.0,
+    noise_scale=1e-8,
     normalize_grads=False,
     dtype=torch.bfloat16,
 )
