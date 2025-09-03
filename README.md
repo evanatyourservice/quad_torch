@@ -12,20 +12,16 @@ model = torch.nn.Linear(10, 10)
 optimizer = QUAD(
     model.parameters(),
     lr=0.001,
-    lr_style="adam",  # "adam", "mu-p", or None
+    lr_style="adam",
     momentum=0.95,
     weight_decay=0.1,
-    preconditioner_lr=0.6,
     max_size_dense=8192,
     max_skew_dense=1.0,
-    noise_scale=1e-8,
-    normalize_grads=False,
+    preconditioner_lr=0.7,
+    noise_scale=1e-9,
     dtype=torch.bfloat16,
 )
 ```
-
-`lr_style` can be "adam" for adam-style scaling, "mu-p" for mu-p scaling based on sqrt(G.shape[-2]), or None for 
-PSGD scaling of RMS=1.0.
 
 
 ## Resources
