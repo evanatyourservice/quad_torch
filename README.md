@@ -23,6 +23,11 @@ optimizer = QUAD(
 )
 ```
 
+Couple notes:
+
+- `lr_style="adam"` is the default and scales the update to match adam's behavior LR-wise and weight decay-wise.
+- `dtype=torch.bfloat16` should be fine for most problems, but if a problem is particularly sensitive then you can try `None` to default to gradient dtypes or `torch.float32` to force f32 precision.
+
 
 ## Resources
 
