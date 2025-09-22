@@ -1,4 +1,4 @@
-# PSGD-QUAD and PSGD-Procrustes
+# PSGD-Procrustes and PSGD-QUAD
 
 `pip install quad-torch`
 
